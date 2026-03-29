@@ -5,6 +5,7 @@ import winreg
 from pathlib import Path
 from typing import Optional, List, Dict, Tuple
 import warnings
+from functools import lru_cache
 
 # Try to import pywin32 for .lnk parsing
 try:
@@ -18,6 +19,75 @@ except ImportError:
 from astrbot.api.event import filter, AstrMessageEvent, MessageEventResult
 from astrbot.api.star import Context, Star, register
 from astrbot.api import logger
+
+
+class SimilarityMatcher:
+    """字符串相似度匹配工具类"""
+
+    # 相似度阈值
+    EXACT_THRESHOLD = 1.0
+    HIGH_SIMILARITY_THRESHOLD = 0.9
+    MEDIUM_SIMILARITY_THRESHOLD = 0.86  # 提高阈值以避免todesk匹配autodesk (0.857 < 0.86)
+
+    @staticmethod
+    @lru_cache(maxsize=1024)
+    def calculate_similarity(term: str, candidate: str) -> float:
+        """计算两个字符串的相似度分数（0-1），带缓存"""
+        import difflib
+        return difflib.SequenceMatcher(None, term.lower(), candidate.lower()).ratio()
+
+    @classmethod
+    def find_best_match(cls, term: str, candidates: List[str],
+                       include_paths: bool = False) -> Optional[Tuple[str, float, Optional[str]]]:
+        """
+        在候选列表中查找最佳匹配
+
+        Args:
+            term: 搜索词
+            candidates: 候选字符串列表
+            include_paths: 是否包含路径信息（候选为(name, path)元组）
+
+        Returns:
+            (最佳匹配名称, 相似度分数, 路径或None)
+        """
+        if not candidates:
+            return None
+
+        best_match = None
+        best_score = 0.0
+        best_path = None
+
+        for candidate in candidates:
+            if include_paths:
+                cand_name, cand_path = candidate
+            else:
+                cand_name = candidate
+                cand_path = None
+
+            # 检查精确匹配（最高优先级）
+            if cand_name.lower() == term.lower():
+                return (cand_name, 1.0, cand_path)
+
+            # 检查前缀匹配（次高优先级）
+            if cand_name.lower().startswith(term.lower()):
+                # 前缀匹配视为高相似度匹配，分数设为0.95
+                return (cand_name, 0.95, cand_path)
+
+            score = cls.calculate_similarity(term, cand_name)
+
+            # 优先级：精确匹配 > 高相似度 > 中等相似度
+            if score == cls.EXACT_THRESHOLD:
+                return (cand_name, score, cand_path)
+            elif score > best_score:
+                best_match = cand_name
+                best_score = score
+                best_path = cand_path
+
+        # 检查是否达到最低相似度阈值
+        if best_score >= cls.MEDIUM_SIMILARITY_THRESHOLD:
+            return (best_match, best_score, best_path)
+
+        return None
 
 
 class RegistrySearcher:
@@ -43,6 +113,17 @@ class RegistrySearcher:
         Returns:
             Full path to the executable if found, None otherwise.
         """
+        # 首先尝试精确匹配（保持向后兼容）
+        exact_path = cls._search_exact(app_name)
+        if exact_path:
+            return exact_path
+
+        # 如果精确匹配失败，尝试相似度匹配
+        return cls._search_by_similarity(app_name)
+
+    @classmethod
+    def _search_exact(cls, app_name: str) -> Optional[str]:
+        """精确匹配搜索（原search_app的逻辑）"""
         # Try with .exe extension if not already present
         if not app_name.lower().endswith('.exe'):
             app_name_exe = app_name + '.exe'
@@ -64,6 +145,27 @@ class RegistrySearcher:
 
             except (OSError, WindowsError, FileNotFoundError):
                 continue
+
+        return None
+
+    @classmethod
+    def _search_by_similarity(cls, app_name: str) -> Optional[str]:
+        """通过相似度匹配搜索应用"""
+        # 获取所有已安装应用
+        apps = cls.list_installed_apps()
+        if not apps:
+            return None
+
+        # 准备候选列表
+        candidates = [(name, path) for name, path in apps.items()]
+
+        # 查找最佳匹配
+        result = SimilarityMatcher.find_best_match(app_name, candidates, include_paths=True)
+
+        if result:
+            match_name, score, match_path = result
+            logger.debug(f"相似度匹配成功: '{app_name}' -> '{match_name}' (相似度: {score:.2f})")
+            return match_path
 
         return None
 
@@ -97,6 +199,7 @@ class RegistrySearcher:
         return None
 
     @classmethod
+    @lru_cache(maxsize=1)
     def list_installed_apps(cls) -> Dict[str, str]:
         """List all registered applications in the registry."""
         apps = {}
@@ -147,12 +250,28 @@ class LnkResolver:
             logger.warning("pywin32 is not available. Cannot search for shortcuts.")
             return None
 
-        search_terms = [app_name.lower()]
-        # Add variations
-        if not app_name.endswith('.lnk'):
-            search_terms.append(app_name.lower() + '.lnk')
-        if not app_name.endswith('.exe'):
-            search_terms.append(app_name.lower() + '.exe')
+        # 收集所有快捷方式名称
+        shortcuts = cls._collect_shortcuts()
+        if not shortcuts:
+            return None
+
+        # 查找最佳匹配
+        result = SimilarityMatcher.find_best_match(app_name, shortcuts, include_paths=False)
+
+        if result:
+            match_name, score, _ = result
+            # 根据匹配名称查找对应的.lnk文件路径
+            for lnk_path, lnk_name in cls._get_shortcut_mapping():
+                if lnk_name.lower() == match_name.lower():
+                    logger.debug(f"快捷方式相似度匹配成功: '{app_name}' -> '{match_name}' (相似度: {score:.2f})")
+                    return lnk_path
+
+        return None
+
+    @classmethod
+    def _collect_shortcuts(cls) -> List[str]:
+        """收集所有快捷方式名称"""
+        shortcuts = []
 
         for start_menu_path in cls.START_MENU_PATHS:
             if not os.path.exists(start_menu_path):
@@ -161,14 +280,29 @@ class LnkResolver:
             for root, dirs, files in os.walk(start_menu_path):
                 for file in files:
                     if file.lower().endswith('.lnk'):
-                        file_lower = file.lower()
-                        # Check if any search term matches
-                        for term in search_terms:
-                            if term in file_lower:
-                                lnk_path = os.path.join(root, file)
-                                return lnk_path
+                        # 移除.lnk扩展名作为候选名称
+                        name = file[:-4] if file.lower().endswith('.lnk') else file
+                        shortcuts.append(name)
 
-        return None
+        return shortcuts
+
+    @classmethod
+    def _get_shortcut_mapping(cls) -> List[Tuple[str, str]]:
+        """获取快捷方式路径和名称的映射"""
+        mapping = []
+
+        for start_menu_path in cls.START_MENU_PATHS:
+            if not os.path.exists(start_menu_path):
+                continue
+
+            for root, dirs, files in os.walk(start_menu_path):
+                for file in files:
+                    if file.lower().endswith('.lnk'):
+                        lnk_path = os.path.join(root, file)
+                        name = file[:-4] if file.lower().endswith('.lnk') else file
+                        mapping.append((lnk_path, name))
+
+        return mapping
 
     @staticmethod
     def resolve_lnk(lnk_path: str) -> Optional[str]:
