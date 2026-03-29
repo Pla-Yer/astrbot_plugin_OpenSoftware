@@ -1,8 +1,10 @@
+import asyncio
 import os
 import subprocess
 import warnings
 import winreg
 from functools import lru_cache
+import difflib
 
 # Try to import pywin32 for .lnk parsing
 try:
@@ -33,8 +35,6 @@ class SimilarityMatcher:
     @lru_cache(maxsize=1024)
     def calculate_similarity(term: str, candidate: str) -> float:
         """计算两个字符串的相似度分数（0-1），带缓存"""
-        import difflib
-
         return difflib.SequenceMatcher(None, term.lower(), candidate.lower()).ratio()
 
     @classmethod
@@ -154,7 +154,7 @@ class RegistrySearcher:
                 if path and os.path.exists(path):
                     return path
 
-            except (OSError, FileNotFoundError):
+            except OSError:
                 continue
 
         return None
@@ -192,26 +192,52 @@ class RegistrySearcher:
                 try:
                     with winreg.OpenKey(root_key, key_name) as app_key:
                         # Read the default value (empty string) which usually contains the path
-                        path, _ = winreg.QueryValueEx(app_key, "")
-                        return path
-                except (OSError, FileNotFoundError):
+                        path, reg_type = winreg.QueryValueEx(app_key, "")
+                        # Only accept REG_SZ or REG_EXPAND_SZ string types
+                        if reg_type not in (winreg.REG_SZ, winreg.REG_EXPAND_SZ):
+                            return None
+                        if isinstance(path, str):
+                            # Expand environment variables if REG_EXPAND_SZ
+                            if reg_type == winreg.REG_EXPAND_SZ:
+                                path = os.path.expandvars(path)
+                            return path
+                except OSError:
                     # Key not found, try to enumerate subkeys
                     try:
                         i = 0
                         while True:
-                            subkey_name = winreg.EnumKey(root_key, i)
+                            try:
+                                subkey_name = winreg.EnumKey(root_key, i)
+                            except OSError:
+                                break
                             if subkey_name.lower() == key_name.lower():
                                 with winreg.OpenKey(root_key, subkey_name) as app_key:
-                                    path, _ = winreg.QueryValueEx(app_key, "")
-                                    return path
+                                    path, reg_type = winreg.QueryValueEx(app_key, "")
+                                    # Only accept REG_SZ or REG_EXPAND_SZ string types
+                                    if reg_type not in (
+                                        winreg.REG_SZ,
+                                        winreg.REG_EXPAND_SZ,
+                                    ):
+                                        i += 1
+                                        continue
+                                    if isinstance(path, str):
+                                        # Expand environment variables if REG_EXPAND_SZ
+                                        if reg_type == winreg.REG_EXPAND_SZ:
+                                            path = os.path.expandvars(path)
+                                        return path
                             i += 1
                     except OSError:
                         # No more subkeys
                         pass
-        except (OSError, FileNotFoundError):
+        except OSError:
             pass
 
         return None
+
+    @classmethod
+    def clear_cache(cls) -> None:
+        """Clear the cache for list_installed_apps."""
+        cls.list_installed_apps.cache_clear()
 
     @classmethod
     @lru_cache(maxsize=1)
@@ -227,7 +253,18 @@ class RegistrySearcher:
                             subkey_name = winreg.EnumKey(root_key, i)
                             try:
                                 with winreg.OpenKey(root_key, subkey_name) as app_key:
-                                    path, _ = winreg.QueryValueEx(app_key, "")
+                                    path, reg_type = winreg.QueryValueEx(app_key, "")
+                                    # Only accept REG_SZ or REG_EXPAND_SZ string types
+                                    if reg_type not in (
+                                        winreg.REG_SZ,
+                                        winreg.REG_EXPAND_SZ,
+                                    ):
+                                        continue
+                                    if not isinstance(path, str):
+                                        continue
+                                    # Expand environment variables if REG_EXPAND_SZ
+                                    if reg_type == winreg.REG_EXPAND_SZ:
+                                        path = os.path.expandvars(path)
                                     if os.path.exists(path):
                                         apps[subkey_name] = path
                             except OSError:
@@ -235,7 +272,7 @@ class RegistrySearcher:
                             i += 1
                         except OSError:
                             break
-            except (OSError, FileNotFoundError):
+            except OSError:
                 continue
         return apps
 
@@ -402,7 +439,7 @@ class AppLauncher:
     """Launch applications with proper GUI visibility."""
 
     @staticmethod
-    def launch_app(exe_path: str) -> tuple[bool, str]:
+    async def launch_app(exe_path: str) -> tuple[bool, str]:
         """
         Launch an application using explorer.exe to ensure GUI visibility.
 
@@ -418,24 +455,32 @@ class AppLauncher:
         try:
             # Use explorer.exe to launch the application for proper GUI visibility
             # explorer.exe will handle UAC prompts and GUI context properly
-            cmd = f'explorer.exe "{exe_path}"'
-            result = subprocess.run(
-                cmd, shell=True, capture_output=True, text=True, timeout=10
+            # Use list argument to avoid shell=True and command injection
+            process = await asyncio.create_subprocess_exec(
+                "explorer.exe",
+                exe_path,
+                stdout=asyncio.subprocess.PIPE,
+                stderr=asyncio.subprocess.PIPE,
             )
 
-            if result.returncode == 0:
+            try:
+                # Wait for process completion with timeout
+                await asyncio.wait_for(process.wait(), timeout=10)
+            except asyncio.TimeoutError:
+                # Explorer might still be working, but we'll consider it launched
+                return True, f"应用程序启动中: {exe_path}"
+
+            if process.returncode == 0:
                 return True, f"应用程序已启动: {exe_path}"
             else:
                 # Try direct execution as fallback
                 try:
-                    subprocess.Popen([exe_path], shell=True)
+                    # Direct execution without shell
+                    await asyncio.create_subprocess_exec(exe_path)
                     return True, f"应用程序已启动 (直接执行): {exe_path}"
                 except Exception as e:
                     return False, f"权限被拒绝或执行失败: {str(e)}"
 
-        except subprocess.TimeoutExpired:
-            # Explorer might still be working
-            return True, f"应用程序启动中: {exe_path}"
         except Exception as e:
             return False, f"启动失败: {str(e)}"
 
@@ -508,7 +553,7 @@ class OpenSoftwarePlugin(Star):
             return
 
         # Launch the application
-        success, message = AppLauncher.launch_app(exe_path)
+        success, message = await AppLauncher.launch_app(exe_path)
 
         if success:
             yield event.plain_result(f"✓ {message}\n(来源: {source})")
@@ -533,6 +578,12 @@ class OpenSoftwarePlugin(Star):
             app_list += f"\n... 以及 {len(apps) - 20} 个其他应用程序"
 
         yield event.plain_result(f"注册的应用程序 ({len(apps)} 个):\n{app_list}")
+
+    @filter.command("refreshapps")
+    async def refresh_apps(self, event: AstrMessageEvent):
+        """刷新已安装应用程序缓存"""
+        RegistrySearcher.clear_cache()
+        yield event.plain_result("已刷新应用程序缓存")
 
     async def terminate(self):
         """插件销毁"""
