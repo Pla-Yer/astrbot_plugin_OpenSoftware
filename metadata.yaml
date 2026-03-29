@@ -3,4 +3,4 @@ display_name: OpenSoftware # 用于展示的名字，可以是方便人类阅读
 desc: 通过Windows注册表和开始菜单快捷方式打开应用程序 # 插件简短描述
 version: v1.0.0 # 插件版本号。格式：v1.1.1 或者 v1.1
 author: YourName # 作者
-repo: https://github.com/YourName/astrbot_plugin_OpenSoftware # 插件的仓库地址
+repo: https://github.com/Pla-Yer/astrbot_plugin_OpenSoftware # 插件的仓库地址
