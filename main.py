@@ -1,24 +1,22 @@
 import os
 import subprocess
-import sys
-import winreg
-from pathlib import Path
-from typing import Optional, List, Dict, Tuple
 import warnings
+import winreg
 from functools import lru_cache
 
 # Try to import pywin32 for .lnk parsing
 try:
-    import win32com.client
     import pythoncom
+    import win32com.client
+
     PYWIN32_AVAILABLE = True
 except ImportError:
     PYWIN32_AVAILABLE = False
     warnings.warn("pywin32 is not installed. LnkResolver will not work.")
 
-from astrbot.api.event import filter, AstrMessageEvent, MessageEventResult
-from astrbot.api.star import Context, Star, register
 from astrbot.api import logger
+from astrbot.api.event import AstrMessageEvent, filter
+from astrbot.api.star import Context, Star, register
 
 
 class SimilarityMatcher:
@@ -27,18 +25,22 @@ class SimilarityMatcher:
     # 相似度阈值
     EXACT_THRESHOLD = 1.0
     HIGH_SIMILARITY_THRESHOLD = 0.9
-    MEDIUM_SIMILARITY_THRESHOLD = 0.86  # 提高阈值以避免todesk匹配autodesk (0.857 < 0.86)
+    MEDIUM_SIMILARITY_THRESHOLD = (
+        0.86  # 提高阈值以避免todesk匹配autodesk (0.857 < 0.86)
+    )
 
     @staticmethod
     @lru_cache(maxsize=1024)
     def calculate_similarity(term: str, candidate: str) -> float:
         """计算两个字符串的相似度分数（0-1），带缓存"""
         import difflib
+
         return difflib.SequenceMatcher(None, term.lower(), candidate.lower()).ratio()
 
     @classmethod
-    def find_best_match(cls, term: str, candidates: List[str],
-                       include_paths: bool = False) -> Optional[Tuple[str, float, Optional[str]]]:
+    def find_best_match(
+        cls, term: str, candidates: list[str], include_paths: bool = False
+    ) -> tuple[str, float, str | None] | None:
         """
         在候选列表中查找最佳匹配
 
@@ -95,15 +97,24 @@ class RegistrySearcher:
 
     # Common registry paths where applications are registered
     REG_PATHS = [
-        (winreg.HKEY_LOCAL_MACHINE, r"SOFTWARE\Microsoft\Windows\CurrentVersion\App Paths"),
-        (winreg.HKEY_CURRENT_USER, r"SOFTWARE\Microsoft\Windows\CurrentVersion\App Paths"),
-        (winreg.HKEY_LOCAL_MACHINE, r"SOFTWARE\WOW6432Node\Microsoft\Windows\CurrentVersion\App Paths"),
+        (
+            winreg.HKEY_LOCAL_MACHINE,
+            r"SOFTWARE\Microsoft\Windows\CurrentVersion\App Paths",
+        ),
+        (
+            winreg.HKEY_CURRENT_USER,
+            r"SOFTWARE\Microsoft\Windows\CurrentVersion\App Paths",
+        ),
+        (
+            winreg.HKEY_LOCAL_MACHINE,
+            r"SOFTWARE\WOW6432Node\Microsoft\Windows\CurrentVersion\App Paths",
+        ),
         (winreg.HKEY_LOCAL_MACHINE, r"SOFTWARE\Classes\Applications"),
         (winreg.HKEY_CURRENT_USER, r"SOFTWARE\Classes\Applications"),
     ]
 
     @classmethod
-    def search_app(cls, app_name: str) -> Optional[str]:
+    def search_app(cls, app_name: str) -> str | None:
         """
         Search for an application by name in Windows Registry.
 
@@ -122,11 +133,11 @@ class RegistrySearcher:
         return cls._search_by_similarity(app_name)
 
     @classmethod
-    def _search_exact(cls, app_name: str) -> Optional[str]:
+    def _search_exact(cls, app_name: str) -> str | None:
         """精确匹配搜索（原search_app的逻辑）"""
         # Try with .exe extension if not already present
-        if not app_name.lower().endswith('.exe'):
-            app_name_exe = app_name + '.exe'
+        if not app_name.lower().endswith(".exe"):
+            app_name_exe = app_name + ".exe"
         else:
             app_name_exe = app_name
             app_name = app_name[:-4]  # Remove .exe for searching without extension
@@ -143,13 +154,13 @@ class RegistrySearcher:
                 if path and os.path.exists(path):
                     return path
 
-            except (OSError, WindowsError, FileNotFoundError):
+            except (OSError, FileNotFoundError):
                 continue
 
         return None
 
     @classmethod
-    def _search_by_similarity(cls, app_name: str) -> Optional[str]:
+    def _search_by_similarity(cls, app_name: str) -> str | None:
         """通过相似度匹配搜索应用"""
         # 获取所有已安装应用
         apps = cls.list_installed_apps()
@@ -160,17 +171,21 @@ class RegistrySearcher:
         candidates = [(name, path) for name, path in apps.items()]
 
         # 查找最佳匹配
-        result = SimilarityMatcher.find_best_match(app_name, candidates, include_paths=True)
+        result = SimilarityMatcher.find_best_match(
+            app_name, candidates, include_paths=True
+        )
 
         if result:
             match_name, score, match_path = result
-            logger.debug(f"相似度匹配成功: '{app_name}' -> '{match_name}' (相似度: {score:.2f})")
+            logger.debug(
+                f"相似度匹配成功: '{app_name}' -> '{match_name}' (相似度: {score:.2f})"
+            )
             return match_path
 
         return None
 
     @staticmethod
-    def _try_registry_path(hive, reg_path, key_name: str) -> Optional[str]:
+    def _try_registry_path(hive, reg_path, key_name: str) -> str | None:
         """Try to read a registry path and return the executable path."""
         try:
             with winreg.OpenKey(hive, reg_path) as root_key:
@@ -179,7 +194,7 @@ class RegistrySearcher:
                         # Read the default value (empty string) which usually contains the path
                         path, _ = winreg.QueryValueEx(app_key, "")
                         return path
-                except (OSError, WindowsError, FileNotFoundError):
+                except (OSError, FileNotFoundError):
                     # Key not found, try to enumerate subkeys
                     try:
                         i = 0
@@ -193,14 +208,14 @@ class RegistrySearcher:
                     except OSError:
                         # No more subkeys
                         pass
-        except (OSError, WindowsError, FileNotFoundError):
+        except (OSError, FileNotFoundError):
             pass
 
         return None
 
     @classmethod
     @lru_cache(maxsize=1)
-    def list_installed_apps(cls) -> Dict[str, str]:
+    def list_installed_apps(cls) -> dict[str, str]:
         """List all registered applications in the registry."""
         apps = {}
         for hive, reg_path in cls.REG_PATHS:
@@ -215,12 +230,12 @@ class RegistrySearcher:
                                     path, _ = winreg.QueryValueEx(app_key, "")
                                     if os.path.exists(path):
                                         apps[subkey_name] = path
-                            except (OSError, WindowsError):
+                            except OSError:
                                 pass
                             i += 1
                         except OSError:
                             break
-            except (OSError, WindowsError, FileNotFoundError):
+            except (OSError, FileNotFoundError):
                 continue
         return apps
 
@@ -230,13 +245,31 @@ class LnkResolver:
 
     # Common Start Menu locations
     START_MENU_PATHS = [
-        os.path.join(os.environ.get('APPDATA', ''), 'Microsoft', 'Windows', 'Start Menu', 'Programs'),
-        os.path.join(os.environ.get('PROGRAMDATA', ''), 'Microsoft', 'Windows', 'Start Menu', 'Programs'),
-        os.path.join(os.environ.get('ALLUSERSPROFILE', ''), 'Microsoft', 'Windows', 'Start Menu', 'Programs'),
+        os.path.join(
+            os.environ.get("APPDATA", ""),
+            "Microsoft",
+            "Windows",
+            "Start Menu",
+            "Programs",
+        ),
+        os.path.join(
+            os.environ.get("PROGRAMDATA", ""),
+            "Microsoft",
+            "Windows",
+            "Start Menu",
+            "Programs",
+        ),
+        os.path.join(
+            os.environ.get("ALLUSERSPROFILE", ""),
+            "Microsoft",
+            "Windows",
+            "Start Menu",
+            "Programs",
+        ),
     ]
 
     @classmethod
-    def find_shortcut(cls, app_name: str) -> Optional[str]:
+    def find_shortcut(cls, app_name: str) -> str | None:
         """
         Find a shortcut by application name in Start Menu.
 
@@ -256,20 +289,24 @@ class LnkResolver:
             return None
 
         # 查找最佳匹配
-        result = SimilarityMatcher.find_best_match(app_name, shortcuts, include_paths=False)
+        result = SimilarityMatcher.find_best_match(
+            app_name, shortcuts, include_paths=False
+        )
 
         if result:
             match_name, score, _ = result
             # 根据匹配名称查找对应的.lnk文件路径
             for lnk_path, lnk_name in cls._get_shortcut_mapping():
                 if lnk_name.lower() == match_name.lower():
-                    logger.debug(f"快捷方式相似度匹配成功: '{app_name}' -> '{match_name}' (相似度: {score:.2f})")
+                    logger.debug(
+                        f"快捷方式相似度匹配成功: '{app_name}' -> '{match_name}' (相似度: {score:.2f})"
+                    )
                     return lnk_path
 
         return None
 
     @classmethod
-    def _collect_shortcuts(cls) -> List[str]:
+    def _collect_shortcuts(cls) -> list[str]:
         """收集所有快捷方式名称"""
         shortcuts = []
 
@@ -279,15 +316,15 @@ class LnkResolver:
 
             for root, dirs, files in os.walk(start_menu_path):
                 for file in files:
-                    if file.lower().endswith('.lnk'):
+                    if file.lower().endswith(".lnk"):
                         # 移除.lnk扩展名作为候选名称
-                        name = file[:-4] if file.lower().endswith('.lnk') else file
+                        name = file[:-4] if file.lower().endswith(".lnk") else file
                         shortcuts.append(name)
 
         return shortcuts
 
     @classmethod
-    def _get_shortcut_mapping(cls) -> List[Tuple[str, str]]:
+    def _get_shortcut_mapping(cls) -> list[tuple[str, str]]:
         """获取快捷方式路径和名称的映射"""
         mapping = []
 
@@ -297,15 +334,15 @@ class LnkResolver:
 
             for root, dirs, files in os.walk(start_menu_path):
                 for file in files:
-                    if file.lower().endswith('.lnk'):
+                    if file.lower().endswith(".lnk"):
                         lnk_path = os.path.join(root, file)
-                        name = file[:-4] if file.lower().endswith('.lnk') else file
+                        name = file[:-4] if file.lower().endswith(".lnk") else file
                         mapping.append((lnk_path, name))
 
         return mapping
 
     @staticmethod
-    def resolve_lnk(lnk_path: str) -> Optional[str]:
+    def resolve_lnk(lnk_path: str) -> str | None:
         """
         Resolve a .lnk file to its target executable path.
 
@@ -345,7 +382,7 @@ class LnkResolver:
                 pass
 
     @classmethod
-    def resolve_app_via_shortcut(cls, app_name: str) -> Optional[str]:
+    def resolve_app_via_shortcut(cls, app_name: str) -> str | None:
         """
         Find and resolve a shortcut for an application.
 
@@ -365,7 +402,7 @@ class AppLauncher:
     """Launch applications with proper GUI visibility."""
 
     @staticmethod
-    def launch_app(exe_path: str) -> Tuple[bool, str]:
+    def launch_app(exe_path: str) -> tuple[bool, str]:
         """
         Launch an application using explorer.exe to ensure GUI visibility.
 
@@ -383,11 +420,7 @@ class AppLauncher:
             # explorer.exe will handle UAC prompts and GUI context properly
             cmd = f'explorer.exe "{exe_path}"'
             result = subprocess.run(
-                cmd,
-                shell=True,
-                capture_output=True,
-                text=True,
-                timeout=10
+                cmd, shell=True, capture_output=True, text=True, timeout=10
             )
 
             if result.returncode == 0:
@@ -407,7 +440,12 @@ class AppLauncher:
             return False, f"启动失败: {str(e)}"
 
 
-@register("opensoftware", "YourName", "通过Windows注册表和开始菜单快捷方式打开应用程序", "1.0.0")
+@register(
+    "opensoftware",
+    "YourName",
+    "通过Windows注册表和开始菜单快捷方式打开应用程序",
+    "1.0.0",
+)
 class OpenSoftwarePlugin(Star):
     def __init__(self, context: Context):
         super().__init__(context)
@@ -438,7 +476,7 @@ class OpenSoftwarePlugin(Star):
             yield event.plain_result("用法: /open <应用程序名称>")
             return
 
-        app_name = parts[1].strip('"\'')
+        app_name = parts[1].strip("\"'")
 
         if not app_name:
             yield event.plain_result("请输入应用程序名称")
@@ -461,8 +499,8 @@ class OpenSoftwarePlugin(Star):
             if os.path.exists(app_name):
                 exe_path = app_name
                 source = "直接路径"
-            elif os.path.exists(app_name + '.exe'):
-                exe_path = app_name + '.exe'
+            elif os.path.exists(app_name + ".exe"):
+                exe_path = app_name + ".exe"
                 source = "直接路径"
 
         if not exe_path:
@@ -487,7 +525,9 @@ class OpenSoftwarePlugin(Star):
             return
 
         # Format the list
-        app_list = "\n".join([f"- {name}: {path}" for name, path in list(apps.items())[:20]])  # Limit to 20
+        app_list = "\n".join(
+            [f"- {name}: {path}" for name, path in list(apps.items())[:20]]
+        )  # Limit to 20
 
         if len(apps) > 20:
             app_list += f"\n... 以及 {len(apps) - 20} 个其他应用程序"
